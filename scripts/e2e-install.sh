@@ -773,6 +773,156 @@ if [[ "$ROUTIER_HEALTH_CODE" == "200" ]]; then
   esac
 fi
 
+# -----------------------------------------------------------------------------
+# Phase 5.9: label system (CRUD + issue-label attach + exclusive scope)
+# -----------------------------------------------------------------------------
+# Feature-detects: if the labels API endpoint doesn't exist (older web version
+# without the feature), skips cleanly. Auto-activates once ework-web is
+# published with the labels feature.
+echo
+echo "====================================================="
+echo "Phase 5.9: label system"
+echo "====================================================="
+LABELS_PROBE=$(curl -sS -o /dev/null -w "%{http_code}" \
+  "http://127.0.0.1:$WORK_PORT/api/e2e/test/issues/1/labels" \
+  -H "Cookie: $AUTH_COOKIE" 2>/dev/null || echo "000")
+if [[ "$LABELS_PROBE" == "404" || "$LABELS_PROBE" == "000" ]]; then
+  info "skipping Phase 5.9 (labels API not present in this ework-web version)"
+else
+  info "create label via management form"
+  LABEL_CREATE_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    "http://127.0.0.1:$WORK_PORT/e2e/test/settings/labels/add" \
+    -H "Cookie: $AUTH_COOKIE" \
+    --data-urlencode 'name=priority/high' \
+    --data-urlencode 'color=#d1242f' \
+    --data-urlencode 'exclusive=1')
+  [[ "$LABEL_CREATE_CODE" == "303" ]] \
+    || fail "label create failed: HTTP $LABEL_CREATE_CODE"
+  pass "label create -> 303"
+
+  info "create non-exclusive label"
+  curl -sS -o /dev/null -X POST \
+    "http://127.0.0.1:$WORK_PORT/e2e/test/settings/labels/add" \
+    -H "Cookie: $AUTH_COOKIE" \
+    --data-urlencode 'name=bug' \
+    --data-urlencode 'color=#84b6eb' >/dev/null
+  pass "second label created"
+
+  info "list labels on issue (GET API)"
+  LABELS_JSON=$(curl -sS \
+    "http://127.0.0.1:$WORK_PORT/api/e2e/test/issues/1/labels" \
+    -H "Cookie: $AUTH_COOKIE")
+  AVAIL_COUNT=$(echo "$LABELS_JSON" | jq -r '.available | length')
+  [[ "$AVAIL_COUNT" -ge 2 ]] \
+    || fail "expected >=2 available labels, got $AVAIL_COUNT"
+  pass "available labels = $AVAIL_COUNT"
+
+  info "attach labels to issue (POST replace)"
+  BUG_ID=$(echo "$LABELS_JSON" | jq -r '.available[] | select(.name=="bug") | .id')
+  PRIO_ID=$(echo "$LABELS_JSON" | jq -r '.available[] | select(.name=="priority/high") | .id')
+  ATTACH_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    "http://127.0.0.1:$WORK_PORT/api/e2e/test/issues/1/labels" \
+    -H "Cookie: $AUTH_COOKIE" \
+    -H "Content-Type: application/json" \
+    -d "{\"labelIds\":[$BUG_ID,$PRIO_ID]}")
+  [[ "$ATTACH_CODE" == "200" ]] \
+    || fail "label attach failed: HTTP $ATTACH_CODE"
+  pass "labels attached -> 200"
+
+  info "verify labels on issue"
+  CURRENT_COUNT=$(curl -sS \
+    "http://127.0.0.1:$WORK_PORT/api/e2e/test/issues/1/labels" \
+    -H "Cookie: $AUTH_COOKIE" | jq -r '.current | length')
+  [[ "$CURRENT_COUNT" -eq 2 ]] \
+    || fail "expected 2 labels on issue, got $CURRENT_COUNT"
+  pass "issue has $CURRENT_COUNT labels"
+
+  info "exclusive-scope eviction: add priority/low, evicts priority/high"
+  curl -sS -o /dev/null -X POST \
+    "http://127.0.0.1:$WORK_PORT/e2e/test/settings/labels/add" \
+    -H "Cookie: $AUTH_COOKIE" \
+    --data-urlencode 'name=priority/low' \
+    --data-urlencode 'color=#fbca04' \
+    --data-urlencode 'exclusive=1' >/dev/null
+  LOW_ID=$(curl -sS \
+    "http://127.0.0.1:$WORK_PORT/api/e2e/test/issues/1/labels" \
+    -H "Cookie: $AUTH_COOKIE" | jq -r '.available[] | select(.name=="priority/low") | .id')
+  curl -sS -o /dev/null -X POST \
+    "http://127.0.0.1:$WORK_PORT/api/e2e/test/issues/1/labels" \
+    -H "Cookie: $AUTH_COOKIE" \
+    -H "Content-Type: application/json" \
+    -d "{\"labelIds\":[$BUG_ID,$LOW_ID]}" >/dev/null
+  AFTER=$(curl -sS \
+    "http://127.0.0.1:$WORK_PORT/api/e2e/test/issues/1/labels" \
+    -H "Cookie: $AUTH_COOKIE" | jq -r '.current[].name' | sort | tr '\n' ',')
+  if echo "$AFTER" | grep -q "priority/low" && ! echo "$AFTER" | grep -q "priority/high"; then
+    pass "exclusive eviction: priority/high replaced by priority/low (current: $AFTER)"
+  else
+    fail "exclusive scope eviction failed (current: $AFTER)"
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Phase 5.10: group-scoped workdir + lifecycle scripts
+# -----------------------------------------------------------------------------
+# Feature-detects via the router strategy endpoint. If groupConfigs field is
+# absent (older router version), skips cleanly.
+echo
+echo "====================================================="
+echo "Phase 5.10: group workdir + lifecycle scripts"
+echo "====================================================="
+if [[ -z "$ROUTER_PORT" ]]; then
+  info "skipping Phase 5.10 (no router configured)"
+else
+  STRATEGY_BODY=$(curl -sS "http://127.0.0.1:$ROUTER_PORT/api/strategy" 2>/dev/null || echo "")
+  if ! echo "$STRATEGY_BODY" | grep -q "groupConfigs" 2>/dev/null; then
+    info "skipping Phase 5.10 (groupConfigs not supported by this router version)"
+  else
+    info "configure group workdir + init script via strategy"
+    MARKER_DIR="$DATA_DIR/e2e-workdir-marker"
+    rm -rf "$MARKER_DIR"
+    GROUP_CFG='{"strategy":"least-loaded","groupBindings":{},"daemonGroups":{},"groupConfigs":{"e2e-group":{"workdirTemplate":"'"$MARKER_DIR"'/{owner}/{repo}/{issue}","initScript":"echo init_ran > marker.txt","destroyScript":"echo destroy_ran > destroy-marker.txt"}}}'
+    SAVE_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+      "http://127.0.0.1:$ROUTER_PORT/api/strategy" \
+      -H "Content-Type: application/json" \
+      -d "$GROUP_CFG")
+    [[ "$SAVE_CODE" == "200" ]] \
+      || fail "groupConfig save failed: HTTP $SAVE_CODE"
+    pass "groupConfig saved -> 200"
+
+    info "bind test repo to e2e-group"
+    BIND_CFG=$(echo "$GROUP_CFG" | jq -c '.groupBindings["e2e/test"] = "e2e-group"')
+    curl -sS -o /dev/null -X POST \
+      "http://127.0.0.1:$ROUTER_PORT/api/strategy" \
+      -H "Content-Type: application/json" \
+      -d "$BIND_CFG" >/dev/null
+    pass "repo bound to group"
+
+    info "create issue to trigger init script in templated workdir"
+    ISSUE2_HEAD=$(curl -sS -i -X POST \
+      "http://127.0.0.1:$WORK_PORT/e2e/test/issues" \
+      -H "Cookie: $AUTH_COOKIE" \
+      --data-urlencode 'title=workdir e2e' \
+      --data-urlencode 'body=trigger workdir')
+    ISSUE2_STATUS=$(printf '%s\n' "$ISSUE2_HEAD" | head -1 | awk '{print $2}')
+    [[ "$ISSUE2_STATUS" == "303" ]] \
+      || fail "issue2 create did not return 303: $ISSUE2_STATUS"
+    pass "issue2 created -> 303"
+
+    info "wait for daemon to process + run init script"
+    sleep 8
+
+    info "verify init script ran (marker file exists)"
+    MARKER_FILE="$MARKER_DIR/e2e/test/2/marker.txt"
+    if [[ -f "$MARKER_FILE" ]] && grep -q "init_ran" "$MARKER_FILE"; then
+      pass "init script ran: $(cat "$MARKER_FILE")"
+    else
+      fail "init script marker not found at $MARKER_FILE"
+      ls -la "$MARKER_DIR/e2e/test/" 2>/dev/null || info "(workdir dir does not exist)"
+    fi
+  fi
+fi
+
 # Phase 7: multi-daemon coordination (requires MySQL shared DB)
 # -----------------------------------------------------------------------------
 if grep -q 'WORK_DB_DRIVER=mysql' "$DATA_DIR/ework-daemon/.env" 2>/dev/null; then
